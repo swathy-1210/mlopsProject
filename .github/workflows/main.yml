@@ -1,0 +1,178 @@
+name: CI/CD Pipeline - Different Job
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.8
+
+      - name: Set up venv and install dependencies
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -r requirements/requirements.txt
+          pip install black pylint pytest
+
+      - name: Cache venv
+        uses: actions/cache@v2
+        with:
+          path: venv
+          key: ${{ runner.os }}-venv-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-venv-
+
+  train:
+    runs-on: self-hosted
+    needs: build
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Restore venv
+        uses: actions/cache@v2
+        with:
+          path: venv
+          key: ${{ runner.os }}-venv-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-venv-
+
+      - name: Run Training
+        run: |
+          source venv/bin/activate
+          python bikeshare_model/train_pipeline.py
+
+  predict:
+    runs-on: self-hosted
+    needs: train
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Restore venv
+        uses: actions/cache@v2
+        with:
+          path: venv
+          key: ${{ runner.os }}-venv-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-venv-
+
+      - name: Run predict
+        run: |
+          source venv/bin/activate
+          python bikeshare_model/predict.py
+
+  test:
+    runs-on: self-hosted
+    needs: predict
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Restore venv
+        uses: actions/cache@v2
+        with:
+          path: venv
+          key: ${{ runner.os }}-venv-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-venv-
+
+      - name: Run pytest
+        run: |
+          source venv/bin/activate
+          pytest tests/test_predictions.py
+
+  lint:
+    runs-on: self-hosted
+    needs: build
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Restore venv
+        uses: actions/cache@v2
+        with:
+          path: venv
+          key: ${{ runner.os }}-venv-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-venv-
+
+      - name: Run linting
+        run: |
+          source venv/bin/activate
+          pylint bikeshare_model/*.py || exit 0
+        continue-on-error: true
+
+      - name: Run Black
+        run: |
+          source venv/bin/activate
+          black bikeshare_model/
+
+  package:
+    runs-on: self-hosted
+    needs: test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Restore venv
+        uses: actions/cache@v2
+        with:
+          path: venv
+          key: ${{ runner.os }}-venv-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-venv-
+
+      - name: Build package
+        run: |
+          source venv/bin/activate
+          pip install --upgrade build
+          python -m build
+          ls -lrt dist/
+
+      - name: Upload wheel file
+        uses: actions/upload-artifact@v2
+        with:
+          name: wheel-file
+          path: dist/bikeshare_model-0.0.1-py3-none-any.whl
+
+  dockerize-and-push:
+    runs-on: self-hosted
+    needs: package
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Download wheel file
+        uses: actions/download-artifact@v2
+        with:
+          name: wheel-file
+          path: .
+
+      - name: Build Docker image
+        run: |
+          cp bikeshare_model-0.0.1-py3-none-any.whl bikeshare_model_api/
+          cd bikeshare_model_api
+          docker build -t bikeshare_model_api .
+
+      - name: Verify Docker image
+        run: docker images
+
+      - name: Log in to DockerHub
+        run: echo "${{ secrets.DOCKER_TOKEN }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+      - name: Push Docker image
+        run: |
+          docker tag bikeshare_model_api ${{ secrets.DOCKER_USERNAME }}/bikeshare_model_api
+          docker push ${{ secrets.DOCKER_USERNAME }}/bikeshare_model_api
